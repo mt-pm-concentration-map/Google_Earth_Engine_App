@@ -1,0 +1,273 @@
+// This code was used in the Google Earth Engine Code Editor
+// to create our web app. 
+
+var modis_col = ee.ImageCollection("MODIS/061/MCD19A2_GRANULES"),
+    noaa_col = ee.ImageCollection("NOAA/NWS/RTMA"),
+    nasa_col = ee.ImageCollection("NASA/GSFC/MERRA/flx/2"),
+    training = ee.FeatureCollection("users/aspenjkmorgan/k_folds/train1_v2");
+
+// Default map 
+var MT = ee.FeatureCollection('TIGER/2018/States').filter(
+  ee.Filter.eq('NAME', 'Montana'));
+var border = MT.style({color:'black', fillColor:'00000000'});
+Map.centerObject(MT, 6);
+Map.addLayer(border, {color: 'black'}, 'Montana');
+Map.style().set({cursor: 'crosshair'});
+var sld_intervals = 
+  '<RasterSymbolizer>' + 
+    '<ColorMap type="intervals" extended="false" >' + 
+      '<ColorMapEntry color="#4caf50" quantity="12.0"/>' + 
+      '<ColorMapEntry color="#ffeb3b" quantity="35.5"/>' + 
+      '<ColorMapEntry color="#ff9800" quantity="55.5"/>' + 
+      '<ColorMapEntry color="#f43636" quantity="150.0"/>' + 
+      '<ColorMapEntry color="#a770b1" quantity="200.0"/>' + 
+      '<ColorMapEntry color="#8e6575" quantity="400"/>' + 
+    '</ColorMap>' + 
+  '</RasterSymbolizer>';
+
+// default datetime (today)
+var datetime = ee.Date(Date.now());
+var cutoff = ee.Date(Date.now()).update({'hour': 19});
+var difference = cutoff.difference(datetime, 'hour');
+var start = ee.Date(ee.Algorithms.If(difference.gt(ee.Number(0)).and(difference.lt(ee.Number(19))),
+  datetime.advance(-1, 'day').update({ 'hour': 17, 'minute': 0, 'second': 0}),
+  datetime.update({'hour': 17, 'minute': 0})));
+var end = start.advance(2, 'hour');
+var pm_selected = getPmRaster(start, end).select('pm_today');
+
+// helper function for AOD cloud masking
+function bitwiseExtract(input, fromBit, toBit){
+  var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
+  var mask = ee.Number(1).leftShift(maskSize).subtract(1);
+  return input.rightShift(fromBit).bitwiseAnd(mask);
+}
+
+// helper function for calculating relative humidity
+function getRH(image){
+  var dp = image.select('DPT');
+  var temp = image.select('TMP');
+  var c1 = ee.Number(17.625);
+  var c2 = ee.Number(243.04);
+  var rel_hum = ee.Image.constant(100).multiply(
+      ((dp.multiply(c1)).divide(dp.add(c2)).exp())
+      .divide(((temp.multiply(c1)).divide(temp.add(c2))).exp())).rename('RH');
+  return image.addBands(rel_hum);
+}
+
+// extract data by start and end
+function getPmRaster(start, end){
+  // importing and cleaning up raster data
+  var modis_image = modis_col.filterDate(start, end).mean();
+  var qa = modis_image.select('AOD_QA').toUint16();
+  var qa_cloud = bitwiseExtract(qa, 0, 2).eq(1);
+  var aod_qa = bitwiseExtract(qa, 5, 7).eq(0);
+  var no_neg = modis_image.select('Optical_Depth_047').gte(0);
+  var mask = qa_cloud.and(aod_qa).and(no_neg); // mask out negative AOD
+  var aod_buf1 = modis_image.updateMask(mask);
+  var aod_buf2 = aod_buf1.reproject({
+    'crs': ee.Projection('EPSG:4326'),
+    'scale': 1000});
+  var aod_image = aod_buf2.select('Optical_Depth_047').multiply(0.001).rename('aod');
+  var band_to_type = {
+    'PRES': 'float', 
+    'TMP': 'float', 
+    'DPT': 'float', 
+    'WDIR': 'float', 
+    'WIND': 'float', 
+  };
+  var order = ['PRES', 'TMP', 'DPT', 'WDIR', 'WIND'];
+  var noaa_bands = noaa_col.select('PRES', 'TMP', 'DPT', 'WDIR', 'WIND');
+  var noaa_bands_fixed = noaa_bands.cast(band_to_type, order);
+  var pblh = nasa_col.select('PBLH');
+  var noaa_image = noaa_bands_fixed.filterDate(start, end).mean().reproject({
+    'crs': ee.Projection('EPSG:4326'),
+    'scale': 1000});
+  noaa_image = getRH(noaa_image); // add RH to noaa_image
+  var pblh_image = pblh.filterDate(start, end).mean().reproject({
+    'crs': ee.Projection('EPSG:4326'),
+    'scale': 1000});
+  var raster = ee.Image.cat(aod_image, noaa_image, pblh_image);
+  
+  // random forest model
+  var best_estimator = ee.Classifier.smileRandomForest({
+    'numberOfTrees': 100, 
+    'variablesPerSplit': 3, 
+    'minLeafPopulation': 2, 
+    'bagFraction': 0.5, 
+    'maxNodes': null, 
+    'seed': 0}).setOutputMode('REGRESSION').train({
+      'features': training,
+      'classProperty': 'pm25',
+      'inputProperties': ['PRES', 'aod', 'RH', 'PBLH', 'DPT', 'WIND', 'WDIR', 'TMP']
+  });
+  
+  return raster.classify(best_estimator, 'pm_today');
+}
+
+// Function to create the intro panel with labels.
+function panelcreate() {
+    var intro = ui.Panel([
+        ui.Label({
+            value: 'Montana PM-2.5 Concentration Map',
+            style: {fontSize: '1.5vw', fontWeight: 'bold', textAlign: 'center', width: '380px'
+            },}),
+        ui.Label({
+            value: 'This app displays a daily map of predicted PM-2.5 (ug/m^3) concentrations in Montana.' +
+            ' The predictions are based on the datasets below and utilize an ensemble machine learning model (random forest).' +
+            ' PM-2.5 predictions are unavailable when there is cloud cover.',
+            style: {
+                fontSize: '1vw',
+                fontWeight: 'normal',
+                width: '380px',
+                padding: '10px'
+            },}),
+      ]);
+panel.add(intro)
+;}
+var names = ['Good (0-12.0 ug/m^3)', 'Moderate (12.1-35.5 ug/m^3)', 'Unhealthy for sensitive groups (35.51-55.5 ug/m^3)', 
+  'Unhealthy (55.51-150.0 ug/m^3)', 'Very unhealthy (150.1-200.0 ug/m^3)', 'Hazardous (200.1+ ug/m^3)'];
+var colors = ['#4caf50', '#ffeb3b', '#ff9800', '#f43636', '#a770b1', '#8e6575'];
+function legendcreate(legend) {
+  var title = ui.Label('Legend', {fontWeight: 'bold', fontSize: '1vw', margin: '0 0 5px 20px'})
+  panel.add(title)
+  for (var i = 0; i < 6; i++) {
+    var name = names[i];
+    var color = colors[i];
+    var colorBox = ui.Label('', {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 0 20px'
+    });
+    var description = ui.Label(name, {margin: '0 0 4px 6px'});
+    panel.add(
+        ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal')));
+  }
+}
+
+// call intro panel function and add to root
+var panel = ui.Panel(); 
+panel.style().set({width: '400px'});
+ui.root.insert(1, panel); 
+panelcreate(); 
+legendcreate();
+
+// function to display pm concentration
+var redrawMap = function(datetime) {
+  Map.layers().reset();
+  Map.addLayer(border);
+  var dt = ee.Date(datetime);
+  var difference = cutoff.difference(dt, 'hour');
+  var condition = difference.gt(ee.Number(0)).and(difference.lt(ee.Number(19)));
+  var start = ee.Date(ee.Algorithms.If(condition, 
+    dt.advance(-1, 'day').update({ 'hour': 17, 'minute': 0, 'second': 0}),
+    dt.update({'hour': 17, 'minute': 0})));
+  var stop = start.advance(2, 'hour');
+  pm_selected = getPmRaster(start, stop).select('pm_today'); // update values based on new date
+  Map.addLayer({eeObject: pm_selected.clip(MT).sldStyle(sld_intervals), // add pm layer to map
+      // visParams: colorParams, 
+      name: 'Predicted PM2.5 on ' + datetime, 
+      opacity: 0.65});
+};
+
+// extract values at different locations
+Map.onClick(function(point){
+  printValues(point)
+});
+
+// print values
+var printValues = function(point) {
+  var coord = ee.Geometry.Point(point.lon, point.lat);
+  var pm_table = pm_selected.reduceRegion(ee.Reducer.mean(), coord);
+  longitude.setValue('Longitude: ' + point.lon.toFixed(2));
+  latitude.setValue('Latitude: ' + point.lat.toFixed(2));
+  pm.setValue('PM2.5 (ug/m^3): ' + pm_table.get('pm_today').getInfo().toFixed(2));
+  // show where user selected
+  var dot = ui.Map.Layer(coord, {color: 'black'});
+  Map.layers().set(2, dot);
+};
+
+// Function to create date slider and its label
+var text = ui.Label({
+  value: 'Select Date',
+  style: {fontSize: '1vw', fontWeight: 'bold', color: 'black'}
+});
+var dateSelector = ui.DateSlider({
+  start: '2012-01-01',
+  style: {width: '200px'}
+});
+dateSelector.onChange(function(value){
+  datetime = ee.List(dateSelector.getValue()).get(0);
+  redrawMap(datetime);
+});
+
+var longitude = ui.Label();
+var latitude = ui.Label();
+var pm = ui.Label();
+
+// Create a panel that contains both the slider and the label.
+var selectionPanel = ui.Panel({
+  widgets: [text, dateSelector, longitude, latitude, pm],
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {padding: '10px'}
+});
+panel.add(selectionPanel);
+
+// Create an inspector panel with a horizontal layout.
+var inspector = ui.Panel({
+    layout: ui.Panel.Layout.flow('vertical')});
+inspector.add(
+  ui.Label({
+    value: 'Click to view PM2.5 concentration', 
+    style: {fontSize: '1.7vmin', fontWeight: 'bold', textAlign: 'center', margin: '0px'}})
+);
+Map.add(inspector);
+
+// Function to create reference panel.
+function referencecreate() {
+    var referenceZero = ui.Label({
+        value: 'Data Sources:',
+        style: {color: 'black', fontWeight: 'bold', textAlign: 'center', padding: '0px 0px 5px 10px'
+        },
+    });
+    var referenceOne = ui.Label({
+        value: 'MCD19A2.061',
+        style: {color: 'black', fontWeight: 'bold', textAlign: 'center', padding: '0px 0px 5px 10px'
+        },
+        targetUrl: 'https://doi.org/10.5067/MODIS/MCD19A2.061'
+    });
+    var referenceTwo = ui.Label({
+        value: 'NOAA RTMA',
+        style: {color: 'black', fontWeight: 'bold', textAlign: 'center', padding: '0px 0px 5px 10px'
+        },
+        targetUrl: 'https://www.nco.ncep.noaa.gov/pmb/products/rtma/'
+    });
+    var referenceThree = ui.Label({
+      value: 'M2T1NXFLX',
+      style: {color: 'black', fontWeight: 'bold', textAlign: 'center', padding: '0px 0px 5px 10px'
+        },
+      targetUrl: 'https://doi.org/10.5067/VJAFPLI1CSIV' 
+    });
+    var referenceFive = ui.Label({
+        value: 'Project Website',
+        style: {color: 'black', fontWeight: 'bold', textAlign: 'center', padding: '0px 0px 5px 10px'
+        },
+        targetUrl: 'https://mt-pm-concentration-map.github.io/'
+    });
+    var citation = ui.Label({
+        value: 'Morgan, A. J., Crowley, J., Nagisetty, R. M., Kumar, R. In preparation. Montana Statewide ' +
+        ' Google Earth Engine-based Wildfire Hazardous Particulate (PM2.5) Concentrations Estimation.',
+        style: {
+                fontSize: '1vw',
+                fontWeight: 'normal',
+                width: '380px',
+                padding: '0px 0px 5px 10px'
+            }
+    });
+    panel.add(citation);
+    panel.add(referenceFive);
+    panel.add(referenceZero);
+    panel.add(referenceOne);
+    panel.add(referenceTwo);
+    panel.add(referenceThree);
+}
+referencecreate();
