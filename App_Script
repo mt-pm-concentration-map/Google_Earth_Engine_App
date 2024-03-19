@@ -1,10 +1,10 @@
-// This code was used in the Google Earth Engine Code Editor
-// to create our web app. 
+// (Copy and paste into Google Earth Engine code editor)
 
-var modis_col = ee.ImageCollection("MODIS/061/MCD19A2_GRANULES"),
-    noaa_col = ee.ImageCollection("NOAA/NWS/RTMA"),
-    nasa_col = ee.ImageCollection("NASA/GSFC/MERRA/flx/2"),
-    training = ee.FeatureCollection("users/aspenjkmorgan/k_folds/train1_v2");
+// Import raster data and model training data
+var modis_col = ee.FeatureCollection('MODIS/061/MCD19A2_GRANULES');
+var noaa_col = ee.FeatureCollection('NOAA/NWS/RTMA');
+var nasa_col = ee.FeatureCollection('NASA/GSFC/MERRA/flx/2');
+var training = ee.FeatureCollection('projects/ee-aspenjkmorgan/assets/For_App/best_training');
 
 // Default map 
 var MT = ee.FeatureCollection('TIGER/2018/States').filter(
@@ -92,13 +92,13 @@ function getPmRaster(start, end){
   var best_estimator = ee.Classifier.smileRandomForest({
     'numberOfTrees': 100, 
     'variablesPerSplit': 3, 
-    'minLeafPopulation': 2, 
-    'bagFraction': 0.5, 
+    'minLeafPopulation': 3, 
+    'bagFraction': 0.9, 
     'maxNodes': null, 
     'seed': 0}).setOutputMode('REGRESSION').train({
       'features': training,
       'classProperty': 'pm25',
-      'inputProperties': ['PRES', 'aod', 'RH', 'PBLH', 'DPT', 'WIND', 'WDIR', 'TMP']
+      'inputProperties': ['PRES', 'aod', 'RH', 'PBLH', 'DPT', 'WIND', 'WDIR']
   });
   
   return raster.classify(best_estimator, 'pm_today');
@@ -112,9 +112,9 @@ function panelcreate() {
             style: {fontSize: '1.5vw', fontWeight: 'bold', textAlign: 'center', width: '380px'
             },}),
         ui.Label({
-            value: 'This app displays a daily map of predicted PM-2.5 (ug/m^3) concentrations in Montana.' +
+            value: 'This app displays a daily map of predicted PM-2.5 (ug/m^3) concentrations in Montana between 17:00 and 19:00UTC.' +
             ' The predictions are based on the datasets below and utilize an ensemble machine learning model (random forest).' +
-            ' PM-2.5 predictions are unavailable when there is cloud cover.',
+            ' PM-2.5 predictions are unavailable in certain regions when there is cloud cover.',
             style: {
                 fontSize: '1vw',
                 fontWeight: 'normal',
